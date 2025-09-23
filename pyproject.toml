@@ -1,0 +1,32 @@
+[project]
+name = "import-cars"
+version = "0.1.0"
+description = "High-throughput scrapers for mobile.de and coches.net"
+authors = [{ name = "Import Cars", email = "dev@importcars.local" }]
+requires-python = ">=3.11"
+dependencies = [
+    "httpx[http2]>=0.27.0",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.2",
+    "selectolax>=0.3",
+    "tenacity>=8.3",
+    "tls-client>=1.0.1",
+    "curl-cffi>=1.8; sys_platform != 'win32'",
+    "typer>=0.12",
+    "orjson>=3.10",
+    "playwright>=1.45",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.1",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.5",
+]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project.scripts]
+import-cars = "import_cars.cli:app"
