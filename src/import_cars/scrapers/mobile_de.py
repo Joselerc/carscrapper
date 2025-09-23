@@ -162,13 +162,7 @@ class MobileDeScraper(BaseScraper):
                     else: # Si no hay etiqueta, asumimos que es el precio principal (bruto)
                         if price_bruto is None:
                             price_bruto = amount
-
-            # Calcular el precio faltante si es posible
-            if price_bruto and not price_neto:
-                price_neto = round(price_bruto / 1.19, 2)
-            elif price_neto and not price_bruto:
-                price_bruto = round(price_neto * 1.19, 2)
-
+            
             details_node = node.css_first("div.vehicle-information")
             details_text = details_node.text(separator=" ", strip=True) if details_node else ""
             
@@ -237,7 +231,16 @@ class MobileDeScraper(BaseScraper):
 
             # --- Fase 2: Scrapeo de la página de detalle ---
             detail_data = await self._scrape_detail_page(context, url)
-            co2_emissions = detail_data.get("co2_emissions_g_km")
+            
+            # --- Lógica de IVA Dinámica ---
+            # Calcular el precio faltante DESPUÉS de obtener la ubicación
+            location = detail_data.get("location")
+            if price_bruto and not price_neto:
+                vat_rate = 1.19 if location and location.country_code == "DE" else 1.21
+                price_neto = round(price_bruto / vat_rate, 2)
+            elif price_neto and not price_bruto:
+                vat_rate = 1.19 if location and location.country_code == "DE" else 1.21
+                price_bruto = round(price_neto * vat_rate, 2)
 
             items.append({
                 "id": ad_id,
@@ -256,7 +259,7 @@ class MobileDeScraper(BaseScraper):
                 "bodyType": body_type,
                 "doors": doors,
                 "colorExterior": color_exterior,
-                "co2Emissions": co2_emissions,
+                "co2Emissions": detail_data.get("co2_emissions_g_km"),
                 "detail_data": detail_data, # Añadir los datos de detalle a la lista de items
             })
         
@@ -315,7 +318,6 @@ class MobileDeScraper(BaseScraper):
                     "Categoría": "body_type"
                 }
                 rows = tech_data_node.css("div.g-row")
-                print(f"DEBUG: Encontradas {len(rows)} filas en datos técnicos.")
                 for row in rows:
                     # Buscamos la clave en el primer span/p y el valor en el segundo
                     key_node = row.css_first("span:first-child, p:first-child")
@@ -361,9 +363,6 @@ class MobileDeScraper(BaseScraper):
                 desc_text_node = description_node.css_first("div.description-text")
                 if desc_text_node:
                     details["description"] = desc_text_node.text(strip=True)
-                    print("DEBUG: Descripción extraída con éxito.")
-            else:
-                print("DEBUG: No se encontró la sección de descripción.")
 
             # 3. Parsear la información del vendedor
             if seller_node:
@@ -413,9 +412,6 @@ class MobileDeScraper(BaseScraper):
                     rating_count=rating_count,
                     phone=phone,
                 )
-                print("DEBUG: Información del vendedor extraída con éxito.")
-            else:
-                print("DEBUG: No se encontró la sección del vendedor.")
 
         except Exception as e:
             print(f"Error procesando página de detalle {url}: {e}")
