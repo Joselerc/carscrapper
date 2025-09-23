@@ -72,7 +72,8 @@ class NormalizedListing(BaseModel):
     make: Optional[str] = None
     model: Optional[str] = None
     version: Optional[str] = None
-    price_eur: Optional[float] = None
+    price_eur: Optional[float] = Field(None, description="Precio Bruto (Gross)")
+    price_net_eur: Optional[float] = Field(None, description="Precio Neto (Net)")
     price_original: Optional[Price] = None
     vat_deductible: Optional[bool] = None
     mileage_km: Optional[int] = None
