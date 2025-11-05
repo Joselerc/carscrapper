@@ -1,9 +1,11 @@
 from __future__ import annotations
+import html
 import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from playwright.async_api import async_playwright
+from playwright_stealth import Stealth
 from selectolax.parser import HTMLParser
 
 from ..config import ScraperSettings
@@ -29,8 +31,13 @@ class MobileDeScraper(BaseScraper):
     """
 
     async def search(self, *, query: Dict[str, Any], limit: Optional[int] = None) -> SearchResult:
-        page = int(query.get("page", 1))
-        page_size = int(query.get("page_size", 24))
+        # Compatibilidad con UnifiedFilters
+        if hasattr(query, 'page'):
+            page = query.page
+            page_size = query.page_size
+        else:
+            page = int(query.get("page", 1))
+            page_size = int(query.get("page_size", 24))
 
         async with async_playwright() as p:
             browser = await p.chromium.launch(
@@ -40,31 +47,76 @@ class MobileDeScraper(BaseScraper):
             )
             context = await browser.new_context(
                 locale="es-ES",
-                user_agent=self.settings.user_agent,
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
                 viewport={"width": 1920, "height": 1080},
-                extra_http_headers={"Accept-Language": "es-ES,es;q=0.9"},
+                extra_http_headers={
+                    "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                },
             )
             
+            # Aplicar stealth a todas las páginas nuevas del contexto
+            print("DEBUG: Aplicando playwright-stealth para evadir detección...")
+            
             # El único método de scraping ahora es este.
-            html = await self._fetch_results_page(context, page_number=page, page_size=page_size)
+            html, active_page = await self._fetch_results_page(context, page_number=page, page_size=page_size)
+            
+            # Aplicar stealth a la página activa (ya aplicado en _fetch_results_page)
+            # if active_page:
+            #     stealth = Stealth()
+            #     await stealth.apply_stealth_async(active_page)
             
             if not html:
+                if active_page:
+                    await active_page.close()
                 await context.close()
                 await browser.close()
                 return SearchResult(listings=[], total_listings=0, result_page=page, has_next=False)
 
-            data = await self._extract_listings_from_html(html, context)
+            # Pasar la página activa y los IDs interceptados para obtener HTML actualizado
+            intercepted_ids = getattr(self, 'intercepted_vehicle_ids', [])
+            print(f"DEBUG: Total de IDs interceptados: {len(intercepted_ids)}")
+            data = await self._extract_listings_from_html(html, context, active_page, intercepted_ids)
+            
+            # Cerrar la página después de extraer los datos
+            if active_page:
+                await active_page.close()
             
             await context.close()
             await browser.close()
             
             return self._parse_response(data, page_number=page, page_size=page_size)
 
-    async def _fetch_results_page(self, context, *, page_number: int, page_size: int) -> Optional[str]:
+    async def _fetch_results_page(self, context, *, page_number: int, page_size: int) -> tuple[Optional[str], Optional[object]]:
         """
-        Navega a la página de resultados con Playwright y devuelve el contenido HTML.
+        Navega a la página de resultados con Playwright y devuelve el contenido HTML y la página.
         """
         page = await context.new_page()
+        
+        # Aplicar stealth inmediatamente a la nueva página
+        stealth_config = Stealth()
+        await stealth_config.apply_stealth_async(page)
+        
+        # Lista para almacenar los IDs de los vehículos interceptados
+        self.intercepted_vehicle_ids = []
+        
+        # Observar requests sin bloquearlos
+        def handle_request(request):
+            url = request.url
+            # Buscar requests que contengan los IDs de vehículos
+            if 'detalles.html' in url or 'id=' in url:
+                print(f"DEBUG: Request capturado: {url[:100]}")
+                # Extraer el ID de la URL
+                match = re.search(r'[?&]id=(\d+)', url)
+                if match:
+                    vehicle_id = match.group(1)
+                    if vehicle_id not in self.intercepted_vehicle_ids:
+                        self.intercepted_vehicle_ids.append(vehicle_id)
+                        print(f"DEBUG: ✓ ID capturado: {vehicle_id}")
+        
+        # Usar on("request") para observar sin bloquear
+        page.on("request", handle_request)
+        
         url = f"{SEARCH_URL},pgn:{page_number},pgs:{page_size}"
         
         try:
@@ -75,48 +127,118 @@ class MobileDeScraper(BaseScraper):
                 button = page.locator("button:has-text('Aceptar')")
                 await button.wait_for(state="visible", timeout=7000)
                 await button.click()
+                print("DEBUG: Cookies aceptadas")
             except Exception:
                 pass # Si no hay banner, asumimos que no es necesario
 
-            # ESPERA SIMPLE: Pausa fija para permitir la carga de elementos dinámicos.
-            await page.wait_for_timeout(3000)
+            # Esperar carga inicial
+            await page.wait_for_timeout(2000)
+
+            # *** HACER SCROLL GRADUAL AQUÍ PARA ACTIVAR LOS REQUESTS DE detalles.html ***
+            print("DEBUG: Haciendo scroll gradual para activar lazy loading y capturar IDs...")
+            
+            # Obtener altura total de la página
+            total_height = await page.evaluate("document.body.scrollHeight")
+            viewport_height = await page.evaluate("window.innerHeight")
+            
+            # Scroll gradual en pasos para que cada anuncio se haga visible y dispare su request
+            scroll_position = 0
+            scroll_step = viewport_height * 0.8  # 80% del viewport
+            
+            while scroll_position < total_height:
+                await page.evaluate(f"window.scrollTo(0, {scroll_position})")
+                await page.wait_for_timeout(800)  # Esperar a que se disparen los requests
+                scroll_position += scroll_step
+                
+                # Actualizar altura total por si se cargó más contenido
+                total_height = await page.evaluate("document.body.scrollHeight")
+            
+            # Scroll al final para asegurar
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await page.wait_for_timeout(1500)
+            
+            print(f"DEBUG: Scroll completado. IDs interceptados: {len(self.intercepted_vehicle_ids)}")
+            print(f"DEBUG: IDs capturados: {self.intercepted_vehicle_ids[:10]}")
 
             html_content = await page.content()
+            return html_content, page
 
         except Exception as e:
             print(f"Error durante la navegación con Playwright: {e}")
             await page.screenshot(path="debug_screenshot.png", full_page=True)
             with open("debug_page.html", "w", encoding="utf-8") as f:
                 f.write(await page.content())
-            html_content = None
-        finally:
             await page.close()
+            return None, None
 
-        return html_content
-
-    async def _extract_listings_from_html(self, html: str, context) -> Dict[str, Any]:
-        tree = HTMLParser(html)
+    async def _extract_listings_from_html(self, html_content: str, context, active_page=None, intercepted_ids=None) -> Dict[str, Any]:
+        # Usar los IDs interceptados del Network durante el scroll en _fetch_results_page
+        ids_from_js = intercepted_ids if intercepted_ids else []
+        
+        if active_page:
+            print(f"DEBUG: Usando {len(ids_from_js)} IDs interceptados del Network")
+            
+            # Obtener HTML actualizado (ya hicimos scroll en _fetch_results_page)
+            updated_html = await active_page.content()
+            
+            # Decodificar entidades HTML
+            decoded_html = html.unescape(updated_html)
+            tree = HTMLParser(decoded_html)
+            print("DEBUG: Usando HTML actualizado de Playwright (decodificado)")
+        else:
+            # Decodificar entidades HTML también para el HTML inicial
+            decoded_html = html.unescape(html_content)
+            tree = HTMLParser(decoded_html)
+            print("DEBUG: Usando HTML inicial (decodificado)")
+        
         items = []
         
-        # Selector principal corregido, basado en tu inspección.
-        listing_nodes = tree.css("a.vehicle-data")
+        # Selector actualizado para la nueva estructura de mobile.de
+        listing_nodes = tree.css("a.BaseListing_containerLink___4jHz")
         print(f"DEBUG: Encontrados {len(listing_nodes)} anuncios en la página de resultados.")
-
+        
         for i, node in enumerate(listing_nodes):
             print(f"DEBUG: Procesando anuncio {i+1}/{len(listing_nodes)}...")
-            url = node.attributes.get("href")
-            if not url:
-                print(f"DEBUG: Anuncio {i+1} saltado por no tener URL.")
-                continue
             
-            # Convertir URL relativa en absoluta
-            if url.startswith("/"):
-                url = f"https://www.mobile.de{url}"
+            # Construir URL a partir del ID extraído con JavaScript
+            if i < len(ids_from_js) and ids_from_js[i]:
+                listing_id = ids_from_js[i]
+                url = f"https://www.mobile.de/es/veh%C3%ADculos/detalles.html?id={listing_id}"
+                print(f"DEBUG: URL construida con ID {listing_id}: {url}")
+            else:
+                # Fallback: intentar del HTML o generar ficticia
+                href_attr = node.attributes.get("href", "")
+                if href_attr and href_attr != "":
+                    if href_attr.startswith("/"):
+                        url = f"https://www.mobile.de{href_attr}"
+                    else:
+                        url = href_attr
+                    print(f"DEBUG: URL del HTML: {url}")
+                else:
+                    testid = node.attributes.get("data-testid", "")
+                    if testid:
+                        testid_match = re.search(r"listing-(\d+)", testid)
+                        if testid_match:
+                            listing_num = testid_match.group(1)
+                            url = f"https://www.mobile.de/listing-{listing_num}"
+                        else:
+                            url = f"https://www.mobile.de/listing-{i+1}"
+                    else:
+                        url = f"https://www.mobile.de/listing-{i+1}"
+                    print(f"DEBUG: URL ficticia generada: {url}")
+                
+            # Solo procesar los primeros 3 para testing
+            if i >= 2:
+                break
 
-            ad_id_match = re.search(r"/(\d+)\.html", url)
-            ad_id = ad_id_match.group(1) if ad_id_match else None
+            # Generar un ID único basado en el data-testid o posición
+            testid = node.attributes.get("data-testid", "")
+            ad_id = testid.replace("-link", "") if testid else f"mobile-de-{i+1}"
 
-            title = node.css_first("h3.vehicle-title").text(strip=True) if node.css_first("h3.vehicle-title") else None
+            title = node.css_first("h2.ListingTitle_title__p3CnA").text(strip=True) if node.css_first("h2.ListingTitle_title__p3CnA") else None
+            # Limpiar el título de prefijos como "Patrocinado"
+            if title:
+                title = re.sub(r"^(Patrocinado|Sponsored)\s*", "", title, flags=re.IGNORECASE).strip()
             
             # --- Extracción de Marca y Modelo ---
             make = None
@@ -140,30 +262,18 @@ class MobileDeScraper(BaseScraper):
                         model = " ".join(model_part.split()[:3])
                         break
             
-            # --- Extracción de precios Bruto y Neto desde el listado ---
-            price_node = node.css_first("div.vehicle-prices")
+            # --- Extracción de precio desde el listado ---
+            price_text = node.css_first("span.PriceLabel_mainPrice__3SZut").text(strip=True) if node.css_first("span.PriceLabel_mainPrice__3SZut") else None
             price_bruto = None
             price_neto = None
 
-            if price_node:
-                price_lines = price_node.css("p")
-                for p in price_lines:
-                    text = p.text(strip=True)
-                    price_match = re.search(r"([0-9\.,]+)", text)
-                    if not price_match:
-                        continue
-                    
-                    amount = float(price_match.group(1).replace(".", "").replace(",", "."))
-
-                    if "bruto" in text.lower():
-                        price_bruto = amount
-                    elif "neto" in text.lower():
-                        price_neto = amount
-                    else: # Si no hay etiqueta, asumimos que es el precio principal (bruto)
-                        if price_bruto is None:
-                            price_bruto = amount
+            if price_text:
+                # Extraer número del precio (ej: "18.950 €" -> 18950)
+                price_match = re.search(r"([0-9\.,]+)", price_text.replace("\u00A0", ""))
+                if price_match:
+                    price_bruto = float(price_match.group(1).replace(".", "").replace(",", "."))
             
-            details_node = node.css_first("div.vehicle-information")
+            details_node = node.css_first("div[data-testid='listing-details-attributes']")
             details_text = details_node.text(separator=" ", strip=True) if details_node else ""
             
             mileage_match = re.search(r"([0-9\.,]+)\s*km", details_text, re.IGNORECASE)
@@ -173,7 +283,8 @@ class MobileDeScraper(BaseScraper):
             registration = None
             if reg_match:
                 m_str, y_str = reg_match.group(1).split("/")
-                registration = Registration(year=int(y_str), month=int(m_str))
+                if m_str and y_str:
+                    registration = Registration(year=int(y_str), month=int(m_str))
 
             # Power (kW and HP) - Coger kW es más robusto y luego se convierte a CV
             power_kw_match = re.search(r"(\d+)\s*kW", details_text, re.IGNORECASE)
@@ -181,65 +292,32 @@ class MobileDeScraper(BaseScraper):
             power_hp = int(power_kw * 1.35962) if power_kw else None
 
             # --- Especificaciones técnicas ---
-            tech_specs_text = ""
-            tech_specs_node = node.css_first("div.vehicle-techspecs")
-            if tech_specs_node:
-                tech_specs_text = tech_specs_node.text(separator=" ", strip=True)
-
             fuel_type = None
             transmission = None
             body_type = None
             color_exterior = None
             doors = None
 
-            if tech_specs_text:
-                # Fuel Type & Transmission por palabras clave
+            if details_text:
+                # Fuel Type por palabras clave
                 fuel_types = ["Diesel", "Gasolina", "Eléctrico", "Híbrido"]
-                transmissions_map = {
-                    "Cambio automático": "Automatic",
-                    "Automático": "Automatic",
-                    "Semiautomático": "Semi-automatic",
-                    "Manual": "Manual"
-                }
-
                 for ft in fuel_types:
-                    if re.search(r'\b' + ft + r'\b', tech_specs_text, re.IGNORECASE):
+                    if re.search(r'\b' + ft + r'\b', details_text, re.IGNORECASE):
                         fuel_type = ft
                         break
 
-                for es_term, en_term in transmissions_map.items():
-                    if re.search(r'\b' + es_term + r'\b', tech_specs_text, re.IGNORECASE):
-                        transmission = en_term
-                        break
+            # Visitar página de detalle si tenemos una URL real
+            detail_data = {}
+            if url and url.startswith('https://www.mobile.de/es/veh') and i < 3:  # Solo primeros 3 para testing
+                detail_data = await self._scrape_detail_page(context, url)
 
-                # Body Type
-                tech_parts = [p.strip() for p in tech_specs_text.split(',') if p.strip()]
-                if tech_parts:
-                    potential_body_type = tech_parts[0]
-                    # Asegurarse de no coger un tipo de combustible o transmisión como carrocería
-                    if potential_body_type not in (fuel_type or "") and potential_body_type not in transmissions_map:
-                        body_type = potential_body_type
-
-                # Color y Puertas con Regex
-                color_match = re.search(r"Color exterior:\s*([^,]+)", tech_specs_text, re.IGNORECASE)
-                if color_match:
-                    color_exterior = color_match.group(1).strip()
-
-                doors_match = re.search(r"Número de puertas:\s*(\d+)", tech_specs_text)
-                if doors_match:
-                    doors = int(doors_match.group(1))
-
-            # --- Fase 2: Scrapeo de la página de detalle ---
-            detail_data = await self._scrape_detail_page(context, url)
-            
             # --- Lógica de IVA Dinámica ---
-            # Calcular el precio faltante DESPUÉS de obtener la ubicación
             location = detail_data.get("location")
             if price_bruto and not price_neto:
-                vat_rate = 1.19 if location and location.country_code == "DE" else 1.21
+                vat_rate = 1.19 if location and location.get("country_code") == "DE" else 1.21
                 price_neto = round(price_bruto / vat_rate, 2)
             elif price_neto and not price_bruto:
-                vat_rate = 1.19 if location and location.country_code == "DE" else 1.21
+                vat_rate = 1.19 if location and location.get("country_code") == "DE" else 1.21
                 price_bruto = round(price_neto * vat_rate, 2)
 
             items.append({
@@ -260,7 +338,7 @@ class MobileDeScraper(BaseScraper):
                 "doors": doors,
                 "colorExterior": color_exterior,
                 "co2Emissions": detail_data.get("co2_emissions_g_km"),
-                "detail_data": detail_data, # Añadir los datos de detalle a la lista de items
+                "detail_data": detail_data,
             })
         
         if not items:
@@ -272,10 +350,107 @@ class MobileDeScraper(BaseScraper):
 
         return {"result": {"items": items, "total": len(items), "pageInfo": {"hasNextPage": has_next}}}
 
+    async def _get_real_urls_with_javascript(self, context) -> List[str]:
+        """
+        Obtiene las URLs reales usando JavaScript después de que se carguen dinámicamente.
+        """
+        try:
+            # Obtener la página actual del contexto
+            pages = context.pages
+            if not pages:
+                print("DEBUG: No hay páginas disponibles en el contexto")
+                return []
+            
+            page = pages[0]  # Usar la primera página (la actual)
+            
+            # Esperar a que las URLs se carguen dinámicamente
+            await page.wait_for_timeout(2000)  # Esperar 2 segundos
+            
+            # Ejecutar JavaScript para obtener las URLs reales
+            urls = await page.evaluate("""
+                () => {
+                    const links = document.querySelectorAll('a.BaseListing_containerLink___4jHz');
+                    const urls = [];
+                    
+                    links.forEach((link, index) => {
+                        let url = link.href;
+                        
+                        // Si la URL es válida y no es la página actual
+                        if (url && url !== window.location.href && url !== '') {
+                            urls.push(url);
+                        } else {
+                            urls.push(null);
+                        }
+                    });
+                    
+                    return urls;
+                }
+            """)
+            
+            # Filtrar URLs válidas
+            valid_urls = []
+            for url in urls:
+                if url and url.startswith('http'):
+                    valid_urls.append(url)
+                else:
+                    valid_urls.append(None)
+            
+            print(f"DEBUG: JavaScript encontró {len(valid_urls)} URLs, {sum(1 for u in valid_urls if u)} válidas")
+            
+            return valid_urls
+            
+        except Exception as e:
+            print(f"DEBUG: Error obteniendo URLs con JavaScript: {e}")
+            return []
+
+    async def _get_real_urls_from_page(self, context) -> List[str]:
+        """
+        Obtiene las URLs reales de los anuncios usando JavaScript desde la página actual.
+        """
+        try:
+            # Obtener la página actual del contexto
+            pages = context.pages
+            if not pages:
+                print("DEBUG: No hay páginas disponibles en el contexto")
+                return []
+            
+            page = pages[0]  # Usar la primera página (la actual)
+            
+            # Ejecutar JavaScript para obtener las URLs reales
+            urls = await page.evaluate("""
+                () => {
+                    const links = document.querySelectorAll('a.BaseListing_containerLink___4jHz');
+                    const urls = [];
+                    
+                    links.forEach((link, index) => {
+                        let url = link.getAttribute('href');
+                        
+                        // Si la URL es relativa, convertirla en absoluta
+                        if (url && url.startsWith('/')) {
+                            url = 'https://www.mobile.de' + url;
+                        }
+                        
+                        urls.push(url);
+                    });
+                    
+                    return urls;
+                }
+            """)
+            
+            # Filtrar URLs válidas
+            valid_urls = [url for url in urls if url and url.startswith('http')]
+            print(f"DEBUG: Obtenidas {len(valid_urls)} URLs reales de {len(urls)} anuncios")
+            
+            return valid_urls
+            
+        except Exception as e:
+            print(f"DEBUG: Error obteniendo URLs reales: {e}")
+            return []
+
     async def _scrape_detail_page(self, context, url: str) -> Dict[str, Any]:
         """
-        Visita la página de detalle de un anuncio y extrae datos adicionales como
-        especificaciones técnicas detalladas y información del vendedor, usando Selectolax para parsear.
+        Visita la página de detalle de un anuncio y extrae datos técnicos usando
+        los selectores data-testid específicos de mobile.de.
         """
         page = await context.new_page()
         details = {}
@@ -285,133 +460,70 @@ class MobileDeScraper(BaseScraper):
             html = await page.content()
             tree = HTMLParser(html)
 
-            # --- Búsqueda robusta de secciones ---
-            all_sections = tree.css("div.vip-details-block")
-            tech_data_node = None
-            description_node = None
-            seller_node = None
-
-            for section in all_sections:
-                title_node = section.css_first("h3")
-                if title_node:
-                    title = title_node.text(strip=True)
-                    if title == "Datos técnicos":
-                        tech_data_node = section
-                    elif title == "Descripción del vehículo":
-                        description_node = section
-                    elif title == "Distribuidor firma":
-                        seller_node = section
+            # Buscar la lista de datos técnicos
+            tech_data_list = tree.css_first("dl.DataList_alternatingColorsList__8ejqq")
             
-            # 1. Parsear la tabla de "Datos técnicos"
-            if tech_data_node:
-                TECH_SPEC_MAP = {
-                    "Primer registro": "first_registration",
-                    "Combustible": "fuel_type",
-                    "Kilometraje": "mileage_km",
-                    "Potencia": "power_hp",
-                    "Capacidad cúbica": "engine_displacement_cc",
-                    "Número de asientos": "seats",
-                    "Número de puertas": "doors",
-                    "Color": "color_exterior",
-                    "Emisiones de CO₂": "co2_emissions_g_km", # Clave flexible
-                    "Consumo de combustible": "consumption_l_100km",
-                    "Categoría": "body_type"
-                }
-                rows = tech_data_node.css("div.g-row")
-                for row in rows:
-                    # Buscamos la clave en el primer span/p y el valor en el segundo
-                    key_node = row.css_first("span:first-child, p:first-child")
-                    value_node = row.css_first("span:last-child, p:last-child")
-                    
-                    if key_node and value_node:
-                        key = key_node.text(strip=True)
-                        value_text = value_node.text(strip=True)
+            if not tech_data_list:
+                print("DEBUG: No se encontró la lista de datos técnicos.")
+                return details
+
+            # Mapeo de data-testid a campos de nuestro modelo
+            field_mapping = {
+                "envkv.co2Emissions-item": "co2_emissions_g_km",
+                "envkv.energyConsumption-item": "consumption_l_100km", 
+                "cubicCapacity-item": "engine_displacement_cc",
+                "numSeats-item": "seats",
+                "doorCount-item": "doors",
+                "transmission-item": "transmission",
+                "color-item": "color_exterior",
+                "interior-item": "color_interior",
+                "emissionClass-item": "emission_class",
+                "numberOfPreviousOwners-item": "previous_owners",
+                "hu-item": "inspection_valid_until",
+                "category-item": "body_type_detail"
+            }
+            
+            # Extraer todos los pares dt/dd
+            dt_elements = tech_data_list.css("dt[data-testid]")
+            
+            for dt in dt_elements:
+                # Código corregido arriba
+                testid = dt.attributes.get("data-testid")
+                dd = dt.css_first("+ dd") # El elemento dd que sigue inmediatamente al dt
+                
+                if testid and dd:
+                    field_name = field_mapping.get(testid)
+                    if field_name:
+                        value_text = dd.text(strip=True)
                         
-                        # Búsqueda flexible de claves
-                        for map_key, field_name in TECH_SPEC_MAP.items():
-                            if map_key in key:
-                                # Limpieza y conversión de datos específicos
-                                if "g/km" in value_text:
-                                    match = re.search(r"(\d+)", value_text)
-                                    details[field_name] = int(match.group(1)) if match else None
-                                elif "l/100km" in value_text:
-                                    match = re.search(r"([\d\.,]+)", value_text)
-                                    if match:
-                                        consumption_value = float(match.group(1).replace(",", "."))
-                                        # Crear el objeto Consumption esperado por el modelo
-                                        details[field_name] = Consumption(combined=consumption_value)
-                                    else:
-                                        details[field_name] = None
-                                elif "cv" in value_text:
-                                    match = re.search(r"\((\d+)\s*cv\)", value_text, re.IGNORECASE)
-                                    details[field_name] = int(match.group(1)) if match else None
-                                elif "ccm" in value_text:
-                                    match = re.search(r"([\d\.]+)", value_text)
-                                    details[field_name] = int(match.group(1).replace(".", "")) if match else None
-                                elif field_name == "doors":
-                                    # Coger solo el primer número si el formato es "4/5"
-                                    match = re.search(r"(\d+)", value_text)
-                                    details[field_name] = int(match.group(1)) if match else None
-                                else:
-                                    details[field_name] = value_text
-                                break # Pasar a la siguiente fila una vez encontrada la clave
-            else:
-                print("DEBUG: No se encontró la sección de datos técnicos.")
-
-            # 2. Parsear la descripción del vehículo
-            if description_node:
-                desc_text_node = description_node.css_first("div.description-text")
-                if desc_text_node:
-                    details["description"] = desc_text_node.text(strip=True)
-
-            # 3. Parsear la información del vendedor
-            if seller_node:
-                name = seller_node.css_first("p").text(strip=True) if seller_node.css_first("p") else None
+                        # Limpieza y conversión de datos específicos
+                        if field_name == "co2_emissions_g_km":
+                            match = re.search(r"(\d+)", value_text)
+                            details[field_name] = int(match.group(1)) if match else None
+                        elif field_name == "consumption_l_100km":
+                            match = re.search(r"([0-9\.,]+)\s*l/100km", value_text)
+                            details[field_name] = float(match.group(1).replace(",", ".")) if match else None
+                        elif field_name == "engine_displacement_cc":
+                            match = re.search(r"([0-9\.,]+)\s*ccm", value_text)
+                            details[field_name] = int(match.group(1).replace(".", "")) if match else None
+                        elif field_name == "doors":
+                            match = re.search(r"(\d+)", value_text)
+                            details[field_name] = int(match.group(1)) if match else None
+                        elif field_name == "previous_owners":
+                            match = re.search(r"(\d+)", value_text)
+                            details[field_name] = int(match.group(1)) if match else None
+                        elif field_name == "inspection_valid_until":
+                            match = re.search(r"(\d{2}/\d{4})", value_text)
+                            if match:
+                                m_str, y_str = match.group(1).split("/")
+                                details[field_name] = {"year": int(y_str), "month": int(m_str)}
+                            else:
+                                details[field_name] = value_text # Guardar texto si no se puede parsear
+                        else:
+                            details[field_name] = value_text
                 
-                phone_node = seller_node.css_first("ul.phone-numbers li")
-                phone = None
-                if phone_node:
-                    phone_text = phone_node.text(strip=True)
-                    match = re.search(r"(\+.*)", phone_text)
-                    if match:
-                        phone = match.group(1).strip()
-
-                location_node = seller_node.css_first("div.g-row div:has(i.mde-icon-flag)")
-                location_obj = None
-                if location_node:
-                    location_text = location_node.text(strip=True)
-                    # Ejemplo: DE-74915 Waibstadt Alemania
-                    match = re.match(r"([A-Z]{2})-(\d+)\s+(.+?)\s+(.+)", location_text)
-                    if match:
-                        country_code, postal_code, city, _ = match.groups()
-                        location_obj = Location(
-                            country_code=country_code,
-                            postal_code=postal_code,
-                            city=city,
-                        )
-                details["location"] = location_obj
-                
-                address_parts = [p.text(strip=True) for p in seller_node.css("p, span")]
-                full_address = ", ".join(filter(None, address_parts[1:]))
-
-                rating_value = None
-                rating_count = None
-                rating_node = seller_node.css_first("div.star-rating-s")
-                if rating_node:
-                    rating_value = float(rating_node.attributes.get('data-rating', 0.0))
-                
-                rating_count_node = seller_node.css_first("a.internal-link")
-                if rating_count_node:
-                    match = re.search(r"\((\d+)", rating_count_node.text())
-                    if match:
-                        rating_count = int(match.group(1))
-
-                details["seller"] = Seller(
-                    name=name,
-                    rating=rating_value,
-                    rating_count=rating_count,
-                    phone=phone,
-                )
+            
+            print(f"DEBUG: Datos de detalle extraídos: {details}")
 
         except Exception as e:
             print(f"Error procesando página de detalle {url}: {e}")

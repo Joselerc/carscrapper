@@ -1,263 +1,429 @@
 from __future__ import annotations
 
-import asyncio
-import copy
-from datetime import datetime
+import logging
+import re
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from ..config import ScraperSettings, get_settings
-from ..http.session import StealthSession, stealth_context
-from ..models import Financing, ListingMetadata, Location, NormalizedListing, Price, Registration, SearchResult, Seller
+import httpx
+
+from ..filters import UnifiedFilters, FilterTranslator
+from ..models import NormalizedListing, SearchResult, Registration, Location, Price, Seller, ListingMetadata
 from .base import BaseScraper
-from ..bootstrap.coches_net import CochesNetBootstrap
 
-
-def _sanitize_headers(headers: Dict[str, str]) -> Dict[str, str]:
-    sanitized: Dict[str, str] = {}
-    for key, value in headers.items():
-        lk = key.lower()
-        if lk in {"content-length", "cookie", "host"}:
-            continue
-        if key.startswith(":"):
-            continue
-        sanitized[key] = value
-    return sanitized
-
-
-def _set_nested(data: Dict[str, Any], path: List[str], value: Any) -> None:
-    current = data
-    for key in path[:-1]:
-        if isinstance(current, dict):
-            current = current.setdefault(key, {})
-        else:
-            return
-    if isinstance(current, dict):
-        current[path[-1]] = value
+logger = logging.getLogger(__name__)
 
 
 class CochesNetScraper(BaseScraper):
-    def __init__(self, *, settings: Optional[ScraperSettings] = None) -> None:
-        super().__init__(settings=settings)
-        self._bootstrap = CochesNetBootstrap(settings=self.settings)
+    def __init__(self):
+        super().__init__()
+        self.base_url = "https://web.gw.coches.net"
+        self.headers = {
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Encoding": "gzip, deflate, br, zstd",
+            "Accept-Language": "es-ES,es;q=0.9",
+            "Content-Type": "application/json",
+            "Origin": "https://www.coches.net",
+            "Referer": "https://www.coches.net/",
+            "Sec-Ch-Ua": '"Chromium";v="142", "Brave";v="142", "Not_A Brand";v="99"',
+            "Sec-Ch-Ua-Mobile": "?1",
+            "Sec-Ch-Ua-Platform": '"Android"',
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-site",
+            "Sec-Gpc": "1",
+            "User-Agent": "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Mobile Safari/537.36",
+            "X-Adevinta-Channel": "web-mobile",
+            "X-Adevinta-Page-Url": "https://www.coches.net/search/",
+            "X-Adevinta-Referer": "https://www.coches.net/search/",
+            "X-Schibsted-Tenant": "coches",
+        }
 
-    async def search(self, *, query: Dict[str, Any], limit: Optional[int] = None) -> SearchResult:
-        template = await self._bootstrap.ensure(force=query.get("force_bootstrap", False))
-        query_params = copy.deepcopy(template.query or {})
-        if query_params is None:
-            query_params = {}
-        page_number = int(query.get("page", int(query_params.get("page", 1))))
-        page_size = int(query.get("page_size", int(query_params.get("pageSize", 24))))
-        query_params["page"] = str(page_number)
-        query_params["pageSize"] = str(page_size)
-
-        overrides: Dict[str, Any] = query.get("overrides", {})
-        for key, value in overrides.items():
-            query_params[key] = value
-
-        response_data = await self._execute_request(
-            template=template.to_json(),
-            query_params=query_params,
-            payload=template.payload if template.method.upper() == "POST" else None,
-        )
-        return self._parse_response(response_data, page_number=page_number, page_size=page_size)
-
-    async def _execute_request(
+    async def search(
         self,
-        *,
-        template: Dict[str, Any],
-        query_params: Dict[str, Any],
-        payload: Optional[Dict[str, Any]],
-    ) -> Dict[str, Any]:
-        async with stealth_context(settings=self.settings) as session:
-            self._preload_cookies(session, template.get("cookies", []))
-            headers = _sanitize_headers(template.get("headers", {}))
-
-            def _call() -> Dict[str, Any]:
-                method = template.get("method", "GET").upper()
-                if method == "POST":
-                    response = session.post(template["url"], json=payload, params=query_params, headers=headers)
-                else:
-                    response = session.get(template["url"], params=query_params, headers=headers)
-                return response.json()
-
-            loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(None, _call)
-
-    @staticmethod
-    def _preload_cookies(session: StealthSession, cookies: List[Dict[str, Any]]) -> None:
-        jar = session._session.cookies  # pylint: disable=protected-access
-        for cookie in cookies:
-            jar.set(
-                name=cookie.get("name"),
-                value=cookie.get("value"),
-                domain=cookie.get("domain"),
-                path=cookie.get("path", "/"),
-            )
-
-    def _parse_response(
-        self,
-        data: Dict[str, Any],
-        *,
-        page_number: int,
-        page_size: int,
+        query: dict,
+        limit: Optional[int] = None,
     ) -> SearchResult:
-        ads = data.get("ads") or data.get("items") or data.get("results") or []
-        listings: List[NormalizedListing] = []
-        for ad in ads:
-            if not isinstance(ad, dict):
-                continue
-            listing = self._to_listing(ad)
-            if listing:
+        # Convertir query a UnifiedFilters si no lo es ya
+        if isinstance(query, dict):
+            filters = UnifiedFilters(**query)
+        else:
+            filters = query
+        
+        # Construir el payload basado en los filtros
+        payload = self._build_search_payload(filters)
+
+        response_data = await self._fetch_results_page(payload)
+        if not response_data:
+            logger.error("No se pudo obtener datos de la API de coches.net.")
+            return SearchResult(listings=[], total_listings=0, result_page=filters.page, has_next=False)
+
+        return self._parse_response(response_data, filters.page, filters.page_size, limit, filters)
+
+    def _build_search_payload(self, filters: UnifiedFilters) -> Dict[str, Any]:
+        """
+        Construye el JSON payload para POST /search/listing basado en la petición real
+        """
+        # Estructura base del payload
+        payload = {
+            "pagination": {
+                "page": filters.page,
+                "size": filters.page_size
+            },
+            "sort": {
+                "order": "desc" if filters.sort_order.value == "desc" else "asc",
+                "term": FilterTranslator.translate_sort_by(filters.sort_by, "coches_net")
+            },
+            "filters": {
+                "batteryCapacity": {"from": None, "to": None},
+                "bodyTypeIds": [],
+                "categories": {"category1Ids": [2500]},  # Coches
+                "chargingTimeFastMode": {"from": None, "to": None},
+                "chargingTimeStandardMode": {"from": None, "to": None},
+                "commitmentMonths": [],
+                "contractId": 0,
+                "drivenWheelsIds": [],
+                "electricAutonomy": {"from": None, "to": None},
+                "entry": None,
+                "environmentalLabels": [],
+                "equipments": [],
+                "fee": {"from": None, "to": None},
+                "fuelTypeIds": [1, 2],  # Diesel y gasolina por defecto
+                "hasOnlineFinancing": None,
+                "hasPhoto": None,
+                "hasReservation": None,
+                "hasStock": None,
+                "hasWarranty": None,
+                "hp": {"from": 50, "to": 500},  # Potencia por defecto
+                "isCertified": False,
+                "km": {"from": 5000, "to": 160000},  # Kilometraje por defecto
+                "luggageCapacity": {"from": None, "to": None},
+                "maxTerms": None,
+                "offerTypeIds": [0, 1, 2, 3, 4, 5],  # Todos los tipos de oferta
+                "onlyPeninsula": False,
+                "price": {"from": None, "to": None},
+                "priceRank": [],
+                "provinceIds": [28],  # Madrid por defecto
+                "rating": {"from": None, "to": None},
+                "searchText": None,
+                "sellerTypeId": 0,  # Todos los vendedores
+                "targetBuyer": None,
+                "transmissionTypeId": 0,  # Todas las transmisiones
+                "vehicles": [],
+                "year": {"from": None, "to": None}
+            }
+        }
+        
+        # Marca
+        if filters.make:
+            make_ids = {
+                "ABARTH": 1330, "ACURA": 1355, "AIWAYS": 1408, "ALFA ROMEO": 1, "ALPINE": 1377,
+                "ARO": 238, "ASIA": 1326, "ASIA MOTORS": 2, "ASTON MARTIN": 3, "AUDI": 4,
+                "AUSTIN": 111, "AUVERLAND": 1321, "BAIC": 1441, "BENTLEY": 6, "BERTONE": 241,
+                "BESTUNE": 1437, "BMW": 7, "BUGATTI": 1345, "BUICK": 1356, "BYD": 1352,
+                "CADILLAC": 8, "CATERHAM": 1357, "CENNTRO": 1415, "CHEVROLET": 9, "CHRYSLER": 10,
+                "CITROEN": 11, "CORVETTE": 1327, "CUPRA": 1400, "DACIA": 1011, "DAEWOO": 12,
+                "DAIHATSU": 13, "DAIMLER": 145, "DATSUN": 1359, "DFSK": 1351, "DODGE": 173,
+                "DONGFENG": 1431, "DR AUTOMOBILES": 1401, "DS": 1358, "EBRO": 210, "EVO": 1410,
+                "FERRARI": 146, "FIAT": 14, "FISKER": 1383, "FORD": 15, "FOTON": 1430,
+                "FUSO": 1397, "GALLOPER": 16, "GMC": 1360, "HOLDEN": 1361, "HONDA": 69,
+                "HONGQI": 1423, "HUMMER": 234, "HYUNDAI": 18, "ICH-X": 1438, "INEOS": 1409,
+                "INFINITI": 1025, "INNOCENTI": 185, "INVICTA": 1405, "INVICTA ELECTRIC": 1413,
+                "ISUZU": 19, "IVECO": 126, "JAECOO": 1434, "JAGUAR": 20, "JEEP": 21,
+                "KGM": 1427, "KIA": 22, "KTM": 1349, "LADA": 153, "LAMBORGHINI": 243,
+                "LANCIA": 23, "LAND-ROVER": 24, "LDV": 128, "LEAPMOTOR": 1432, "LEVC": 1407,
+                "LEXUS": 25, "LIGIER": 163, "LIVAN": 1439, "LOTUS": 147, "LYNK & CO": 1404,
+                "MAHINDRA": 246, "MASERATI": 26, "MAXUS": 1403, "MAYBACH": 1323, "MAZDA": 27,
+                "MCLAREN": 1347, "MERCEDES-BENZ": 28, "MG": 29, "M-HERO": 1428, "MICRO": 1433,
+                "MINI": 222, "MITSUBISHI": 30, "MOBILIZE": 1440, "MORGAN": 149, "MW MOTORS": 1419,
+                "NEXTEM": 1417, "NISSAN": 31, "OMODA": 1420, "OPEL": 32, "PEUGEOT": 33,
+                "PIAGGIO": 87, "POLESTAR": 1402, "PONTIAC": 112, "PORSCHE": 34, "QOROS": 1348,
+                "RAM": 1372, "RENAULT": 35, "RENAULT V.I.": 1329, "ROLLS-ROYCE": 36, "ROVER": 37,
+                "SAAB": 38, "SAIC": 1399, "SANTANA": 1328, "SEAT": 39, "SERES": 1422,
+                "SKODA": 40, "SKYWELL": 1425, "SMART": 41, "SSANGYONG": 42, "SUBARU": 43,
+                "SUZUKI": 44, "SWM": 1411, "TALBOT": 156, "TATA": 45, "TESLA": 1354,
+                "TOYOTA": 46, "TRIDENT": 1353, "UMM": 1324, "VAZ": 1325, "VOLKSWAGEN": 47,
+                "VOLVO": 48, "VOYAH": 1426, "XPENG": 1435, "YUDO": 1421, "ZHIDOU": 1418
+            }
+            make_id = make_ids.get(filters.make)
+            if make_id:
+                payload["filters"]["vehicles"] = [{
+                    "make": filters.make.upper(),
+                    "makeId": make_id,
+                    "model": None,
+                    "modelId": 0
+                }]
+        
+        # Rango de precios
+        if filters.price_range:
+            if filters.price_range.min_price:
+                payload["filters"]["price"]["from"] = int(filters.price_range.min_price)
+            if filters.price_range.max_price:
+                payload["filters"]["price"]["to"] = int(filters.price_range.max_price)
+        
+        # Rango de años
+        if filters.year_range:
+            if filters.year_range.min_year:
+                payload["filters"]["year"]["from"] = filters.year_range.min_year
+            if filters.year_range.max_year:
+                payload["filters"]["year"]["to"] = filters.year_range.max_year
+        
+        # Rango de kilometraje
+        if filters.mileage_range:
+            if filters.mileage_range.min_mileage:
+                payload["filters"]["km"]["from"] = filters.mileage_range.min_mileage
+            if filters.mileage_range.max_mileage:
+                payload["filters"]["km"]["to"] = filters.mileage_range.max_mileage
+        
+        # Rango de potencia
+        if filters.power_range:
+            if filters.power_range.min_power_hp:
+                payload["filters"]["hp"]["from"] = filters.power_range.min_power_hp
+            if filters.power_range.max_power_hp:
+                payload["filters"]["hp"]["to"] = filters.power_range.max_power_hp
+        
+        # Tipos de combustible
+        if filters.fuel_types:
+            fuel_ids = {
+                "gasoline": 2, "diesel": 1, "electric": 3, "hybrid": 4,
+                "hybrid_plug_in": 5, "lpg": 6, "cng": 7, "hydrogen": 8
+            }
+            fuel_type_ids = []
+            for fuel_type in filters.fuel_types:
+                fuel_id = fuel_ids.get(fuel_type.value)
+                if fuel_id:
+                    fuel_type_ids.append(fuel_id)
+            if fuel_type_ids:
+                payload["filters"]["fuelTypeIds"] = fuel_type_ids
+        
+        # Transmisión
+        if filters.transmissions:
+            trans_ids = {"manual": 2, "automatic": 1, "semi_automatic": 3}
+            if len(filters.transmissions) == 1:
+                trans_id = trans_ids.get(filters.transmissions[0].value)
+                if trans_id:
+                    payload["filters"]["transmissionTypeId"] = trans_id
+        
+        # Tipo de vendedor
+        if filters.dealer_only:
+            payload["filters"]["sellerTypeId"] = 1
+        elif filters.private_only:
+            payload["filters"]["sellerTypeId"] = 2
+        
+        return payload
+
+    async def _fetch_results_page(self, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        # Headers específicos basados en la petición real
+        headers = {
+            "accept": "application/json, text/plain, */*",
+            "accept-encoding": "gzip, deflate, br, zstd",
+            "accept-language": "es-ES,es;q=0.9",
+            "origin": "https://www.coches.net",
+            "referer": "https://www.coches.net/",
+            "sec-ch-ua": '"Chromium";v="142", "Brave";v="142", "Not_A Brand";v="99"',
+            "sec-ch-ua-mobile": "?1",
+            "sec-ch-ua-platform": '"Android"',
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-site",
+            "user-agent": "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Mobile Safari/537.36",
+            "x-adevinta-channel": "web-mobile",
+            "x-adevinta-page-url": "https://www.coches.net/search/",
+            "x-adevinta-referer": "https://www.coches.net/search/",
+            "x-schibsted-tenant": "coches"
+        }
+        
+        async with httpx.AsyncClient(base_url=self.base_url, headers=headers, timeout=30.0) as client:
+            try:
+                url = "/search/listing"
+                logger.info(f"Realizando petición POST a {url} con payload: {payload}")
+                response = await client.post(url, json=payload)
+                response.raise_for_status()
+                logger.info("Petición exitosa. Parseando JSON.")
+                json_data = response.json()
+                logger.info(f"Respuesta JSON recibida: {json_data}")
+                return json_data
+            except httpx.HTTPStatusError as e:
+                logger.error(f"Error HTTP al obtener resultados: {e.response.status_code} - {e.response.text}")
+                return None
+            except httpx.RequestError as e:
+                logger.error(f"Error de red al obtener resultados: {e}")
+                return None
+
+    def _parse_response(self, data: Dict[str, Any], page_num: int, page_size: int, limit: Optional[int] = None, filters: Optional[UnifiedFilters] = None) -> SearchResult:
+        """Parsea la respuesta JSON del endpoint /listing y convierte a NormalizedListing"""
+        items = data.get("items", [])
+        meta = data.get("meta", {})
+        
+        total_results = meta.get("totalResults", 0)
+        total_pages = meta.get("totalPages", 0)
+        has_next = page_num < total_pages
+        
+        listings = []
+        for item_data in items:
+            listing = self._to_listing(item_data)
+            if listing and self._matches_filters(listing, filters):
                 listings.append(listing)
-        pagination = data.get("pagination") or data.get("metadata", {}).get("pagination", {})
-        total = pagination.get("total") or pagination.get("totalResults") or data.get("total")
-        has_next = pagination.get("hasNext")
-        if has_next is None and total is not None:
-            has_next = page_number * page_size < total
+                if limit and len(listings) >= limit:
+                    break
+        
+        logger.info(f"Procesados {len(listings)} anuncios de {len(items)} elementos")
+        
         return SearchResult(
             listings=listings,
-            total_listings=total,
-            result_page=page_number,
-            result_page_size=page_size,
-            has_next=has_next,
+            total_listings=total_results,
+            result_page=page_num,
+            result_page_size=len(listings),
+            has_next=has_next
         )
 
-    def _to_listing(self, ad: Dict[str, Any]) -> Optional[NormalizedListing]:
-        listing_id = str(ad.get("id") or ad.get("advertId") or ad.get("code") or "")
-        if not listing_id:
-            return None
-        url = ad.get("url") or ad.get("canonicalUrl") or ad.get("detailUrl")
-        if not url:
-            return None
-        price_info = ad.get("price") or ad.get("prices") or {}
-        amount = price_info.get("price") or price_info.get("amount") or price_info.get("value")
-        currency = price_info.get("currency") or price_info.get("currencyCode") or "EUR"
-        price_original = None
-        price_eur = None
-        if amount is not None:
-            price_original = Price(amount=float(amount), currency_code=currency)
-            if currency.upper() == "EUR":
-                price_eur = float(amount)
+    def _matches_filters(self, listing: 'NormalizedListing', filters: Optional[UnifiedFilters]) -> bool:
+        """Verifica si un listing cumple exactamente con los filtros especificados"""
+        if not filters:
+            return True
+        
+        # Filtro por marca (más estricto)
+        if filters.make:
+            if not listing.make:
+                return False
+            # Comparación case-insensitive y normalizada
+            listing_make = listing.make.upper().replace("-", " ").strip()
+            filter_make = filters.make.upper().replace("-", " ").strip()
+            if listing_make != filter_make:
+                return False
+        
+        # Filtro por modelo
+        if filters.model:
+            if not listing.model:
+                return False
+            if listing.model.upper() != filters.model.upper():
+                return False
+        
+        # Filtro por rango de precios
+        if filters.price_range:
+            if listing.price_eur is not None:
+                if filters.price_range.min_price and listing.price_eur < filters.price_range.min_price:
+                    return False
+                if filters.price_range.max_price and listing.price_eur > filters.price_range.max_price:
+                    return False
+        
+        # Filtro por rango de años
+        if filters.year_range and listing.first_registration and listing.first_registration.year:
+            year = listing.first_registration.year
+            if filters.year_range.min_year and year < filters.year_range.min_year:
+                return False
+            if filters.year_range.max_year and year > filters.year_range.max_year:
+                return False
+        
+        # Filtro por rango de kilometraje
+        if filters.mileage_range and listing.mileage_km is not None:
+            if filters.mileage_range.min_mileage and listing.mileage_km < filters.mileage_range.min_mileage:
+                return False
+            if filters.mileage_range.max_mileage and listing.mileage_km > filters.mileage_range.max_mileage:
+                return False
+        
+        # Filtro por rango de potencia
+        if filters.power_range and listing.power_hp is not None:
+            if filters.power_range.min_power and listing.power_hp < filters.power_range.min_power:
+                return False
+            if filters.power_range.max_power and listing.power_hp > filters.power_range.max_power:
+                return False
+        
+        return True
 
-        mileage = ad.get("kms") or ad.get("kilometers") or ad.get("mileage")
-        registration = None
-        first_reg = ad.get("firstRegistration") or ad.get("firstRegistrationDate")
-        if isinstance(first_reg, str):
-            parts = first_reg.split("-")
-            try:
-                year = int(parts[0])
-            except (ValueError, IndexError):
-                year = None
-            month = None
-            if len(parts) > 1:
+    def _to_listing(self, data: Dict[str, Any]) -> Optional[NormalizedListing]:
+        """Convierte un elemento JSON de coches.net a NormalizedListing"""
+        try:
+            listing_id = data.get("id")
+            if not listing_id:
+                return None
+
+            # URL del anuncio
+            url_path = data.get("url", "")
+            url = f"https://www.coches.net{url_path}" if url_path.startswith("/") else url_path
+
+            # Precio - estructura del endpoint /listing
+            price_data = data.get("price", {})
+            price_eur = price_data.get("amount")
+
+            # Registro
+            year = data.get("year")
+            registration = Registration(year=year) if year else None
+
+            # Ubicación
+            location_data = data.get("location", {})
+            location = None
+            if location_data:
+                location = Location(
+                    country_code="ES",
+                    region=location_data.get("regionLiteral"),
+                    province=location_data.get("mainProvince"),
+                    city=location_data.get("cityLiteral"),
+                    postal_code=None
+                )
+
+            # Vendedor
+            seller_data = data.get("seller", {})
+            seller = None
+            if seller_data:
+                seller = Seller(
+                    type="dealer" if seller_data.get("isProfessional") else "private",
+                    name=seller_data.get("name"),
+                    phone=data.get("phone")  # El teléfono está en el nivel superior
+                )
+
+            # Cilindrada (convertir de cc a litros si es necesario)
+            cubic_capacity = data.get("cubicCapacity")
+            engine_displacement_cc = cubic_capacity if cubic_capacity else None
+
+            # Calcular power_kw si tenemos power_hp
+            power_hp = data.get("hp")
+            power_kw = int(power_hp / 1.35962) if power_hp else None
+
+            # Fechas de publicación
+            creation_date = data.get("creationDate")
+            published_date = data.get("publishedDate")
+            
+            # Usar publishedDate si existe, sino creationDate
+            publish_date = None
+            if published_date:
                 try:
-                    month = int(parts[1])
-                except ValueError:
-                    month = None
-            if year:
-                registration = Registration(year=year, month=month)
-        elif isinstance(first_reg, dict):
-            year = first_reg.get("year")
-            month = first_reg.get("month")
-            if year:
-                registration = Registration(year=int(year), month=int(month) if month else None)
+                    publish_date = datetime.fromisoformat(published_date.replace('Z', '+00:00'))
+                except:
+                    pass
+            elif creation_date:
+                try:
+                    publish_date = datetime.fromisoformat(creation_date.replace('Z', '+00:00'))
+                except:
+                    pass
 
-        seller_block = ad.get("dealer") or ad.get("seller") or {}
-        seller = Seller(
-            type=seller_block.get("type") or seller_block.get("sellerType"),
-            name=seller_block.get("name") or seller_block.get("dealerName"),
-            rating=seller_block.get("rating"),
-            rating_count=seller_block.get("ratingCount") or seller_block.get("reviews"),
-            phone=seller_block.get("phone") or seller_block.get("phoneNumber"),
-            email=seller_block.get("email"),
-            dealer_id=str(seller_block.get("id")) if seller_block.get("id") else None,
-        ) if seller_block else None
+            # Crear metadata con fecha de publicación
+            from ..models import ListingMetadata
+            metadata = ListingMetadata(publish_date=publish_date)
 
-        location_block = ad.get("location") or seller_block.get("location", {}) if seller_block else {}
-        location = Location(
-            country_code=location_block.get("country") or location_block.get("countryCode"),
-            region=location_block.get("region") or location_block.get("province"),
-            city=location_block.get("city"),
-            postal_code=location_block.get("postalCode") or location_block.get("zip"),
-            latitude=location_block.get("latitude"),
-            longitude=location_block.get("longitude"),
-        ) if location_block else None
+            return NormalizedListing(
+                listing_id=str(listing_id),
+                source="coches_net",
+                url=url,
+                scraped_at=datetime.now(timezone.utc),
+                title=data.get("title"),
+                make=data.get("make"),
+                model=data.get("model"),
+                price_eur=price_eur,
+                price_original=Price(amount=price_eur, currency_code="EUR") if price_eur else None,
+                mileage_km=data.get("km"),
+                first_registration=registration,
+                power_hp=data.get("hp"),
+                power_kw=int(data.get("hp") / 1.36) if data.get("hp") else None,
+                fuel_type=data.get("fuelType"),
+                engine_displacement_cc=data.get("cubicCapacity"),
+                location=location,
+                seller=seller,
+                metadata=metadata
+            )
 
-        images = []
-        image_block = ad.get("images") or ad.get("photos") or []
-        if isinstance(image_block, list):
-            for img in image_block:
-                if isinstance(img, dict):
-                    url_candidate = img.get("url") or img.get("uri") or img.get("href")
-                else:
-                    url_candidate = img
-                if url_candidate:
-                    images.append(url_candidate)
-
-        features = ad.get("equipments") or ad.get("features") or []
-        if isinstance(features, dict):
-            features = [value for group in features.values() for value in group]
-
-        financing_block = ad.get("financing") or {}
-        financing = Financing(
-            available=bool(financing_block.get("available")),
-            amount=float(financing_block.get("monthlyPayment")) if financing_block.get("monthlyPayment") else None,
-            rate=float(financing_block.get("interestRate")) if financing_block.get("interestRate") else None,
-            duration_months=financing_block.get("term") or financing_block.get("duration"),
-        ) if financing_block else None
-
-        metadata = ListingMetadata(
-            advert_type=ad.get("category"),
-            vehicle_id=ad.get("vehicleId") or ad.get("vehicleCode"),
-            publish_date=self._parse_datetime(ad.get("publishDate")),
-            update_date=self._parse_datetime(ad.get("updateDate")),
-            certified=ad.get("certified") or ad.get("isCertified"),
-            delivery_options=ad.get("delivery"),
-        )
-
-        return NormalizedListing(
-            listing_id=listing_id,
-            source="coches_net",
-            url=url,
-            scraped_at=datetime.utcnow(),
-            title=ad.get("title") or ad.get("headline"),
-            make=ad.get("make") or ad.get("brand"),
-            model=ad.get("model"),
-            version=ad.get("version") or ad.get("trim"),
-            price_eur=price_eur,
-            price_original=price_original,
-            vat_deductible=ad.get("vatDeductible") or ad.get("vat"),
-            mileage_km=int(mileage) if mileage is not None else None,
-            first_registration=registration,
-            fuel_type=ad.get("fuelType") or ad.get("fuel"),
-            transmission=ad.get("transmission") or ad.get("gearbox"),
-            power_hp=ad.get("powerHP") or ad.get("powerHp") or ad.get("power"),
-            power_kw=ad.get("powerKW") or ad.get("powerKw"),
-            body_type=ad.get("bodyType") or ad.get("category"),
-            doors=ad.get("doors"),
-            seats=ad.get("seats"),
-            color_exterior=ad.get("colour") or ad.get("color"),
-            color_interior=ad.get("interiorColour") or ad.get("interior"),
-            emission_class=ad.get("emissionClass"),
-            co2_emissions_g_km=ad.get("co2") or ad.get("co2Emission"),
-            features=features if isinstance(features, list) else [],
-            description=ad.get("description"),
-            images=images,
-            location=location,
-            seller=seller,
-            metadata=metadata,
-            import_ready_score=None,
-        )
-
-    @staticmethod
-    def _parse_datetime(value: Optional[str]) -> Optional[datetime]:
-        if not value:
-            return None
-        for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%d"):
-            try:
-                return datetime.strptime(value, fmt)
-            except ValueError:
-                continue
+        except Exception as e:
+            logger.error(f"Error procesando elemento: {e}")
         return None
 
 
