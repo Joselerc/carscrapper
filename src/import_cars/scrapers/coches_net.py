@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 
-from ..data import COCHES_NET_MAKES
+from ..data import COCHES_NET_MAKES, COCHES_NET_FUEL_TYPES, COCHES_NET_TRANSMISSION_TYPES
 from ..filters import UnifiedFilters, FilterTranslator
 from ..models import NormalizedListing, SearchResult, Registration, Location, Price, Seller, ListingMetadata
 from .base import BaseScraper
@@ -156,13 +156,9 @@ class CochesNetScraper(BaseScraper):
         
         # Tipos de combustible
         if filters.fuel_types:
-            fuel_ids = {
-                "gasoline": 2, "diesel": 1, "electric": 3, "hybrid": 4,
-                "hybrid_plug_in": 5, "lpg": 6, "cng": 7, "hydrogen": 8
-            }
             fuel_type_ids = []
             for fuel_type in filters.fuel_types:
-                fuel_id = fuel_ids.get(fuel_type.value)
+                fuel_id = COCHES_NET_FUEL_TYPES.get(fuel_type.value)
                 if fuel_id:
                     fuel_type_ids.append(fuel_id)
             if fuel_type_ids:
@@ -170,9 +166,8 @@ class CochesNetScraper(BaseScraper):
         
         # Transmisión
         if filters.transmissions:
-            trans_ids = {"manual": 2, "automatic": 1, "semi_automatic": 3}
             if len(filters.transmissions) == 1:
-                trans_id = trans_ids.get(filters.transmissions[0].value)
+                trans_id = COCHES_NET_TRANSMISSION_TYPES.get(filters.transmissions[0].value)
                 if trans_id:
                     payload["filters"]["transmissionTypeId"] = trans_id
         

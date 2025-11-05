@@ -21,6 +21,7 @@ from ..models import (
     SearchResult,
     NormalizedListing,
 )
+from ..utils import build_mobile_de_search_url
 
 
 class MobileDeHttpScraper:
@@ -44,65 +45,8 @@ class MobileDeHttpScraper:
         }
 
     def _build_search_url(self, filters: UnifiedFilters, page: int = 1) -> str:
-        """Construir URL de búsqueda con filtros"""
-        base_url = "https://www.mobile.de/es/veh%C3%ADculos/buscar.html"
-        
-        params = [
-            "isSearchRequest=true",
-            "ref=quickSearch",
-            "s=Car",
-            "vc=Car",
-        ]
-        
-        # Paginación (mobile.de usa pageNumber)
-        if page > 1:
-            params.append(f"pageNumber={page}")
-        
-        # Filtros básicos
-        if filters.make:
-            params.append(f"make={filters.make}")
-        if filters.model:
-            params.append(f"model={filters.model}")
-        
-        # Precio
-        if filters.price_range:
-            if filters.price_range.min_price:
-                params.append(f"minPrice={filters.price_range.min_price}")
-            if filters.price_range.max_price:
-                params.append(f"maxPrice={filters.price_range.max_price}")
-        
-        # Kilometraje
-        if filters.mileage_range:
-            if filters.mileage_range.max_mileage:
-                params.append(f"maxMileage={filters.mileage_range.max_mileage}")
-        
-        # Año
-        if filters.year_range:
-            if filters.year_range.min_year:
-                params.append(f"minFirstRegistrationDate={filters.year_range.min_year}")
-            if filters.year_range.max_year:
-                params.append(f"maxFirstRegistrationDate={filters.year_range.max_year}")
-        
-        # Combustible
-        if filters.fuel_types:
-            fuel_map = {
-                "gasoline": "PETROL",
-                "diesel": "DIESEL",
-                "electric": "ELECTRIC",
-                "hybrid": "HYBRID",
-            }
-            for fuel in filters.fuel_types:
-                mapped = fuel_map.get(fuel.lower(), fuel.upper())
-                params.append(f"fuel={mapped}")
-        
-        # Potencia
-        if filters.power_range:
-            if filters.power_range.min_power_hp:
-                params.append(f"minPower={filters.power_range.min_power_hp}")
-            if filters.power_range.max_power_hp:
-                params.append(f"maxPower={filters.power_range.max_power_hp}")
-        
-        return f"{base_url}?{'&'.join(params)}"
+        """Construir URL de búsqueda con filtros usando el URL builder"""
+        return build_mobile_de_search_url(filters, page)
 
     def search(self, query: Optional[UnifiedFilters] = None, limit: Optional[int] = None) -> SearchResult:
         """Buscar anuncios con filtros"""
