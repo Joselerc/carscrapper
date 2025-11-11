@@ -412,6 +412,372 @@ def compare(
     asyncio.run(_compare())
 
 
+@app.command("comparar")
+def comparar(
+    # ========== PARÁMETROS COMUNES (modo simple) ==========
+    make: Optional[str] = typer.Option(None, help="Marca (modo simple, aplica a ambos)"),
+    model: Optional[str] = typer.Option(None, help="Modelo (modo simple, aplica a ambos)"),
+    fuel_types: Optional[str] = typer.Option(None, help="Combustibles (modo simple)"),
+    transmissions: Optional[str] = typer.Option(None, help="Transmisiones (modo simple)"),
+    limit: Optional[int] = typer.Option(50, help="Límite por fuente (modo simple)"),
+    
+    # ========== ALEMANIA (mobile.de) - Parámetros específicos ==========
+    de_make: Optional[str] = typer.Option(None, help="🇩🇪 Marca para Alemania"),
+    de_model: Optional[str] = typer.Option(None, help="🇩🇪 Modelo para Alemania"),
+    de_min_price: Optional[float] = typer.Option(None, help="🇩🇪 Precio mínimo (EUR)"),
+    de_max_price: Optional[float] = typer.Option(None, help="🇩🇪 Precio máximo (EUR)"),
+    de_min_year: Optional[int] = typer.Option(None, help="🇩🇪 Año mínimo"),
+    de_max_year: Optional[int] = typer.Option(None, help="🇩🇪 Año máximo"),
+    de_min_mileage: Optional[int] = typer.Option(None, help="🇩🇪 Kilometraje mínimo"),
+    de_max_mileage: Optional[int] = typer.Option(None, help="🇩🇪 Kilometraje máximo"),
+    de_min_power: Optional[int] = typer.Option(None, help="🇩🇪 Potencia mínima (HP)"),
+    de_max_power: Optional[int] = typer.Option(None, help="🇩🇪 Potencia máxima (HP)"),
+    de_fuel_types: Optional[str] = typer.Option(None, help="🇩🇪 Combustibles"),
+    de_transmissions: Optional[str] = typer.Option(None, help="🇩🇪 Transmisiones"),
+    de_dealer_only: bool = typer.Option(False, help="🇩🇪 Solo concesionarios"),
+    de_private_only: bool = typer.Option(False, help="🇩🇪 Solo particulares"),
+    de_limit: Optional[int] = typer.Option(None, help="🇩🇪 Límite de anuncios"),
+    
+    # ========== ESPAÑA (coches.net) - Parámetros específicos ==========
+    es_make: Optional[str] = typer.Option(None, help="🇪🇸 Marca para España"),
+    es_model: Optional[str] = typer.Option(None, help="🇪🇸 Modelo para España"),
+    es_min_price: Optional[float] = typer.Option(None, help="🇪🇸 Precio mínimo (EUR)"),
+    es_max_price: Optional[float] = typer.Option(None, help="🇪🇸 Precio máximo (EUR)"),
+    es_min_year: Optional[int] = typer.Option(None, help="🇪🇸 Año mínimo"),
+    es_max_year: Optional[int] = typer.Option(None, help="🇪🇸 Año máximo"),
+    es_min_mileage: Optional[int] = typer.Option(None, help="🇪🇸 Kilometraje mínimo"),
+    es_max_mileage: Optional[int] = typer.Option(None, help="🇪🇸 Kilometraje máximo"),
+    es_min_power: Optional[int] = typer.Option(None, help="🇪🇸 Potencia mínima (HP)"),
+    es_max_power: Optional[int] = typer.Option(None, help="🇪🇸 Potencia máxima (HP)"),
+    es_fuel_types: Optional[str] = typer.Option(None, help="🇪🇸 Combustibles"),
+    es_transmissions: Optional[str] = typer.Option(None, help="🇪🇸 Transmisiones"),
+    es_dealer_only: bool = typer.Option(False, help="🇪🇸 Solo concesionarios"),
+    es_private_only: bool = typer.Option(False, help="🇪🇸 Solo particulares"),
+    es_limit: Optional[int] = typer.Option(None, help="🇪🇸 Límite de anuncios"),
+    
+    # ========== EXPORTACIÓN ==========
+    export_filename: Optional[str] = typer.Option(None, help="Nombre del CSV de salida"),
+) -> None:
+    """
+    🔍 Compara anuncios entre mobile.de (Alemania) y coches.net (España)
+    
+    Modos de uso:
+    1. Simple: --make "BMW" --model "X5" --de-max-price 30000 --es-max-price 40000
+    2. Avanzado: --de-make "BMW" --de-model "X5" --es-make "BMW" --es-model "X5 xDrive"
+    """
+    
+    # Importar aquí para evitar problemas de importación circular
+    from .utils import import_calculator, TipoCompra
+    import csv
+    from datetime import datetime
+    
+    async def _comparar():
+        # ========== DETERMINAR MODO ==========
+        modo_avanzado = any([
+            de_make, de_model, de_min_price, de_max_price,
+            es_make, es_model, es_min_price, es_max_price
+        ])
+        
+        if modo_avanzado:
+            console.print("[bold yellow]Modo avanzado: Parametros especificos por pais[/bold yellow]")
+        else:
+            console.print("[bold blue]Modo simple: Mismos parametros para ambos paises[/bold blue]")
+        
+        # ========== CONSTRUIR FILTROS ALEMANIA ==========
+        if modo_avanzado:
+            de_filters = UnifiedFilters(
+                make=de_make,
+                model=de_model,
+                price_range=PriceRange(min_price=de_min_price, max_price=de_max_price) if de_min_price or de_max_price else None,
+                year_range=YearRange(min_year=de_min_year, max_year=de_max_year) if de_min_year or de_max_year else None,
+                mileage_range=MileageRange(min_mileage=de_min_mileage, max_mileage=de_max_mileage) if de_min_mileage or de_max_mileage else None,
+                power_range=PowerRange(min_power_hp=de_min_power, max_power_hp=de_max_power) if de_min_power or de_max_power else None,
+                fuel_types=_parse_fuel_types(de_fuel_types),
+                transmissions=_parse_transmissions(de_transmissions),
+                dealer_only=de_dealer_only if de_dealer_only else None,
+                private_only=de_private_only if de_private_only else None,
+            )
+            de_limit_final = de_limit or limit
+        else:
+            de_filters = UnifiedFilters(
+                make=make,
+                model=model,
+                fuel_types=_parse_fuel_types(fuel_types),
+                transmissions=_parse_transmissions(transmissions),
+            )
+            de_limit_final = limit
+        
+        # ========== CONSTRUIR FILTROS ESPAÑA ==========
+        if modo_avanzado:
+            es_filters = UnifiedFilters(
+                make=es_make,
+                model=es_model,
+                price_range=PriceRange(min_price=es_min_price, max_price=es_max_price) if es_min_price or es_max_price else None,
+                year_range=YearRange(min_year=es_min_year, max_year=es_max_year) if es_min_year or es_max_year else None,
+                mileage_range=MileageRange(min_mileage=es_min_mileage, max_mileage=es_max_mileage) if es_min_mileage or es_max_mileage else None,
+                power_range=PowerRange(min_power_hp=es_min_power, max_power_hp=es_max_power) if es_min_power or es_max_power else None,
+                fuel_types=_parse_fuel_types(es_fuel_types),
+                transmissions=_parse_transmissions(es_transmissions),
+                dealer_only=es_dealer_only if es_dealer_only else None,
+                private_only=es_private_only if es_private_only else None,
+            )
+            es_limit_final = es_limit or limit
+        else:
+            es_filters = UnifiedFilters(
+                make=make,
+                model=model,
+                fuel_types=_parse_fuel_types(fuel_types),
+                transmissions=_parse_transmissions(transmissions),
+            )
+            es_limit_final = limit
+        
+        console.print("\n" + "="*80)
+        console.print("INICIANDO BUSQUEDA COMPARATIVA")
+        console.print("="*80)
+        
+        # ========== SCRAPING PARALELO ==========
+        mobile_listings = []
+        coches_listings = []
+        
+        # Solo scrapear si hay filtros definidos
+        tasks = []
+        
+        if de_filters.make or modo_avanzado:
+            console.print(f"\n[bold blue]Buscando en mobile.de (Alemania)...[/bold blue]")
+            if de_filters.make:
+                console.print(f"   Marca: {de_filters.make}")
+            if de_filters.model:
+                console.print(f"   Modelo: {de_filters.model}")
+            
+            mobile_scraper = MobileDeHttpScraper()
+            # MobileDeHttpScraper es síncrono, ejecutarlo en un executor
+            import concurrent.futures
+            loop = asyncio.get_event_loop()
+            mobile_task = loop.run_in_executor(
+                None, 
+                lambda: mobile_scraper.search(query=de_filters, limit=de_limit_final)
+            )
+            tasks.append(("mobile", mobile_task))
+        
+        if es_filters.make or modo_avanzado:
+            console.print(f"\n[bold blue]Buscando en coches.net (Espana)...[/bold blue]")
+            if es_filters.make:
+                console.print(f"   Marca: {es_filters.make}")
+            if es_filters.model:
+                console.print(f"   Modelo: {es_filters.model}")
+            
+            coches_scraper = CochesNetScraper()
+            coches_task = coches_scraper.search(query=es_filters, limit=es_limit_final)
+            tasks.append(("coches", coches_task))
+        
+        if not tasks:
+            console.print("[yellow]No se especificaron filtros. Usa --make o parametros especificos (--de-make, --es-make)[/yellow]")
+            return
+        
+        # Ejecutar scraping en paralelo
+        results = await asyncio.gather(*[task for _, task in tasks], return_exceptions=True)
+        
+        # Procesar resultados
+        for (source, _), result in zip(tasks, results):
+            if isinstance(result, Exception):
+                console.print(f"[red]Error en {source}: {result}[/red]")
+            else:
+                if source == "mobile":
+                    mobile_listings = result.listings
+                    console.print(f"[green]mobile.de: {len(mobile_listings)} anuncios encontrados[/green]")
+                else:
+                    coches_listings = result.listings
+                    console.print(f"[green]coches.net: {len(coches_listings)} anuncios encontrados[/green]")
+        
+        if not mobile_listings and not coches_listings:
+            console.print("[yellow]No se encontraron anuncios en ninguna fuente[/yellow]")
+            return
+        
+        # ========== CALCULAR BREAK-EVEN PARA ALEMANIA ==========
+        console.print("\n" + "="*80)
+        console.print("CALCULANDO COSTES DE IMPORTACION (Alemania -> Espana)")
+        console.print("="*80)
+        
+        # Diccionario para almacenar break-even por listing_id
+        break_even_data = {}
+        
+        for listing in mobile_listings:
+            if listing.price_eur:
+                # Calcular los 3 escenarios de break-even
+                be_particular = import_calculator.calcular_costes_importacion(
+                    listing.price_eur, TipoCompra.PARTICULAR, listing.co2_emissions_g_km
+                )["break_even"]
+                be_empresa_iva = import_calculator.calcular_costes_importacion(
+                    listing.price_eur, TipoCompra.EMPRESA_IVA, listing.co2_emissions_g_km
+                )["break_even"]
+                be_empresa_margen = import_calculator.calcular_costes_importacion(
+                    listing.price_eur, TipoCompra.EMPRESA_MARGEN, listing.co2_emissions_g_km
+                )["break_even"]
+                
+                # Guardar en diccionario
+                break_even_data[listing.listing_id] = {
+                    "particular": be_particular,
+                    "empresa_iva": be_empresa_iva,
+                    "empresa_margen": be_empresa_margen
+                }
+        
+        # ========== GUARDAR EN CSV ==========
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = export_filename or f"comparacion_{timestamp}.csv"
+        if not filename.endswith(".csv"):
+            filename += ".csv"
+        
+        output_dir = Path("exports")
+        output_dir.mkdir(exist_ok=True)
+        filepath = output_dir / filename
+        
+        with open(filepath, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            
+            # Encabezados
+            writer.writerow([
+                "source", "make", "model", "year", "mileage_km", "fuel_type", 
+                "transmission", "power_hp", "price_eur", "seller_type",
+                "break_even_particular", "break_even_empresa_iva", "break_even_empresa_margen",
+                "co2_g_km", "url"
+            ])
+            
+            # Datos de Alemania
+            for listing in mobile_listings:
+                be_data = break_even_data.get(listing.listing_id, {})
+                writer.writerow([
+                    "mobile_de",
+                    listing.make or "",
+                    listing.model or "",
+                    listing.first_registration.year if listing.first_registration else "",
+                    listing.mileage_km or "",
+                    listing.fuel_type or "",
+                    listing.transmission or "",
+                    listing.power_hp or "",
+                    listing.price_eur or "",
+                    listing.seller.type if listing.seller else "",
+                    be_data.get("particular", ""),
+                    be_data.get("empresa_iva", ""),
+                    be_data.get("empresa_margen", ""),
+                    listing.co2_emissions_g_km or "",
+                    str(listing.url)
+                ])
+            
+            # Datos de España
+            for listing in coches_listings:
+                writer.writerow([
+                    "coches_net",
+                    listing.make or "",
+                    listing.model or "",
+                    listing.first_registration.year if listing.first_registration else "",
+                    listing.mileage_km or "",
+                    listing.fuel_type or "",
+                    listing.transmission or "",
+                    listing.power_hp or "",
+                    listing.price_eur or "",
+                    listing.seller.type if listing.seller else "",
+                    "",  # No hay break-even para España
+                    "",
+                    "",
+                    listing.co2_emissions_g_km or "",
+                    str(listing.url)
+                ])
+        
+        console.print(f"\n[green]CSV guardado en: {filepath}[/green]")
+        
+        # ========== RESUMEN COMPARATIVO ==========
+        console.print("\n" + "="*80)
+        console.print("RESUMEN COMPARATIVO")
+        console.print("="*80)
+        
+        table = Table(title="Comparacion de Mercados")
+        table.add_column("Pais", style="cyan", justify="center")
+        table.add_column("Anuncios", style="magenta", justify="right")
+        table.add_column("Precio Promedio", style="green", justify="right")
+        table.add_column("Precio Minimo", style="yellow", justify="right")
+        table.add_column("Precio Maximo", style="red", justify="right")
+        
+        # Alemania
+        if mobile_listings:
+            prices_de = [l.price_eur for l in mobile_listings if l.price_eur]
+            if prices_de:
+                table.add_row(
+                    "Alemania",
+                    str(len(mobile_listings)),
+                    f"{sum(prices_de)/len(prices_de):,.0f} EUR",
+                    f"{min(prices_de):,.0f} EUR",
+                    f"{max(prices_de):,.0f} EUR"
+                )
+        
+        # Espana
+        if coches_listings:
+            prices_es = [l.price_eur for l in coches_listings if l.price_eur]
+            if prices_es:
+                table.add_row(
+                    "Espana",
+                    str(len(coches_listings)),
+                    f"{sum(prices_es)/len(prices_es):,.0f} EUR",
+                    f"{min(prices_es):,.0f} EUR",
+                    f"{max(prices_es):,.0f} EUR"
+                )
+        
+        console.print(table)
+        
+        # Mostrar oportunidades (si hay datos de ambos mercados)
+        if mobile_listings and coches_listings:
+            console.print("\n" + "="*80)
+            console.print("ANALISIS DE OPORTUNIDADES")
+            console.print("="*80)
+            
+            # Calcular precio promedio de España
+            prices_es = [l.price_eur for l in coches_listings if l.price_eur]
+            avg_price_es = sum(prices_es) / len(prices_es) if prices_es else 0
+            
+            # Encontrar oportunidades en Alemania
+            oportunidades = []
+            for listing in mobile_listings:
+                be_data = break_even_data.get(listing.listing_id, {})
+                be_particular = be_data.get("particular")
+                if listing.price_eur and be_particular:
+                    margen = avg_price_es - be_particular
+                    if margen > 0:
+                        oportunidades.append({
+                            "listing": listing,
+                            "break_even": be_particular,
+                            "margen": margen,
+                            "rentabilidad": (margen / be_particular) * 100
+                        })
+            
+            if oportunidades:
+                # Ordenar por rentabilidad
+                oportunidades.sort(key=lambda x: x["rentabilidad"], reverse=True)
+                
+                opp_table = Table(title=f"Top 5 Oportunidades (vs precio promedio Espana: {avg_price_es:,.0f} EUR)")
+                opp_table.add_column("Modelo", style="cyan")
+                opp_table.add_column("Precio DE", style="yellow", justify="right")
+                opp_table.add_column("Break-even", style="magenta", justify="right")
+                opp_table.add_column("Margen", style="green", justify="right")
+                opp_table.add_column("Rentabilidad", style="red", justify="right")
+                
+                for opp in oportunidades[:5]:
+                    listing = opp["listing"]
+                    opp_table.add_row(
+                        f"{listing.make} {listing.model}",
+                        f"{listing.price_eur:,.0f} EUR",
+                        f"{opp['break_even']:,.0f} EUR",
+                        f"{opp['margen']:,.0f} EUR",
+                        f"{opp['rentabilidad']:.1f}%"
+                    )
+                
+                console.print(opp_table)
+            else:
+                console.print("[yellow]No se encontraron oportunidades rentables con estos filtros[/yellow]")
+        
+        console.print("\n[bold green]Comparacion completada[/bold green]")
+    
+    asyncio.run(_comparar())
+
+
 @app.command("filtros")
 def show_filters():
     """Muestra todas las opciones de filtro disponibles para coches.net y mobile.de"""

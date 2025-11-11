@@ -7,7 +7,12 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 
-from ..data import COCHES_NET_MAKES, COCHES_NET_FUEL_TYPES, COCHES_NET_TRANSMISSION_TYPES
+from ..data import (
+    COCHES_NET_MAKES,
+    COCHES_NET_FUEL_TYPES,
+    COCHES_NET_TRANSMISSION_TYPES,
+    get_cochesnet_model_id_by_name,
+)
 from ..filters import UnifiedFilters, FilterTranslator
 from ..models import NormalizedListing, SearchResult, Registration, Location, Price, Seller, ListingMetadata
 from .base import BaseScraper
@@ -58,6 +63,12 @@ class CochesNetScraper(BaseScraper):
         if not response_data:
             logger.error("No se pudo obtener datos de la API de coches.net.")
             return SearchResult(listings=[], total_listings=0, result_page=filters.page, has_next=False)
+
+        # Extraer y mostrar el total de resultados disponibles
+        meta = response_data.get("meta", {})
+        total_results = meta.get("totalResults", 0)
+        if total_results > 0:
+            print(f"Total de anuncios disponibles: {total_results}")
 
         return self._parse_response(response_data, filters.page, filters.page_size, limit, filters)
 
@@ -115,16 +126,25 @@ class CochesNetScraper(BaseScraper):
             }
         }
         
-        # Marca
+        # Marca y modelo
         if filters.make:
             make_id = COCHES_NET_MAKES.get(filters.make.upper())
             if make_id:
-                payload["filters"]["vehicles"] = [{
+                vehicle_filter = {
                     "make": filters.make.upper(),
                     "makeId": make_id,
                     "model": None,
                     "modelId": 0
-                }]
+                }
+                
+                # Si se especifica modelo, buscar su ID
+                if filters.model:
+                    model_id = get_cochesnet_model_id_by_name(filters.make, filters.model)
+                    if model_id:
+                        vehicle_filter["model"] = filters.model.upper()
+                        vehicle_filter["modelId"] = int(model_id)
+                
+                payload["filters"]["vehicles"] = [vehicle_filter]
         
         # Rango de precios
         if filters.price_range:

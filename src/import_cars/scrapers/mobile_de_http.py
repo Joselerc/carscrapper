@@ -22,6 +22,7 @@ from ..models import (
     NormalizedListing,
 )
 from ..utils import build_mobile_de_search_url
+from ..utils.import_calculator import import_calculator, TipoCompra
 
 
 class MobileDeHttpScraper:
@@ -53,30 +54,37 @@ class MobileDeHttpScraper:
         filters = query or UnifiedFilters()
         all_listings = []
         page = 1
+        total_available = None
         
-        print(f"🔍 Iniciando búsqueda HTTP en mobile.de...")
+        print(f"Iniciando busqueda HTTP en mobile.de...")
         
         while True:
             url = self._build_search_url(filters, page)
-            print(f"📄 Página {page}: {url}")
+            print(f"Pagina {page}: {url}")
             
             # Obtener HTML de la página de listado
             response = self.session.get(url, headers=self.headers)
             response.raise_for_status()
             
+            # Extraer total de resultados (solo en la primera página)
+            if page == 1:
+                total_available = self._extract_total_results(response.text)
+                if total_available:
+                    print(f"Total de anuncios disponibles: {total_available}")
+            
             # Extraer IDs de anuncios
             ids = self._extract_ids_from_listing(response.text)
-            print(f"   ✓ {len(ids)} IDs encontrados")
+            print(f"   OK - {len(ids)} IDs encontrados")
             
             if not ids:
-                print("   ⚠️  No se encontraron más anuncios")
+                print("   ADVERTENCIA: No se encontraron mas anuncios")
                 break
             
             # Obtener detalles de cada anuncio
             listings = self._fetch_details_parallel(ids, max_workers=10)
             all_listings.extend(listings)
             
-            print(f"   ✓ {len(listings)} anuncios procesados (Total: {len(all_listings)})")
+            print(f"   OK - {len(listings)} anuncios procesados (Total: {len(all_listings)}" + (f"/{total_available}" if total_available else "") + ")")
             
             # Verificar límite
             if limit and len(all_listings) >= limit:
@@ -86,19 +94,43 @@ class MobileDeHttpScraper:
             # Verificar si hay más páginas
             has_next = self._has_next_page(response.text)
             if not has_next:
-                print("   ℹ️  No hay más páginas")
+                print("   INFO: No hay mas paginas")
                 break
             
             page += 1
         
-        print(f"\n✅ Scraping completado: {len(all_listings)} anuncios")
+        print(f"\nScraping completado: {len(all_listings)} anuncios extraidos" + (f" de {total_available} totales" if total_available else ""))
+        
+        # Calcular costes de importación para cada anuncio
+        if all_listings:
+            print("\n" + "="*80)
+            print("ANALISIS DE COSTES DE IMPORTACION (Alemania -> Espana)")
+            print("="*80)
+            self._print_import_analysis(all_listings)
         
         return SearchResult(
             listings=all_listings,
-            total_listings=len(all_listings),
+            total_listings=total_available or len(all_listings),
             result_page=page,
             has_next=False,
         )
+
+    def _extract_total_results(self, html_content: str) -> Optional[int]:
+        """Extraer el número total de resultados de la búsqueda"""
+        try:
+            # Método 1: Buscar en el JSON embebido de Next.js
+            match = re.search(r'"numResultsTotal":(\d+)', html_content)
+            if match:
+                return int(match.group(1))
+            
+            # Método 2: Buscar en el texto visible (fallback)
+            match = re.search(r'(\d+)\s*resultados?', html_content, re.IGNORECASE)
+            if match:
+                return int(match.group(1))
+            
+            return None
+        except Exception:
+            return None
 
     def _extract_ids_from_listing(self, html_content: str) -> List[str]:
         """Extraer IDs de anuncios del HTML de listado"""
@@ -126,7 +158,7 @@ class MobileDeHttpScraper:
                         listings.append(listing)
                 except Exception as e:
                     id_ = future_to_id[future]
-                    print(f"      ⚠️  Error en ID {id_}: {e}")
+                    print(f"      ERROR en ID {id_}: {e}")
         
         return listings
 
@@ -141,7 +173,7 @@ class MobileDeHttpScraper:
             return self._parse_detail_page(response.text, vehicle_id, url)
         
         except Exception as e:
-            print(f"      ⚠️  Error obteniendo detalle {vehicle_id}: {e}")
+            print(f"      ERROR obteniendo detalle {vehicle_id}: {e}")
             return None
 
     def _parse_detail_page(self, html_content: str, vehicle_id: str, url: str) -> Optional[NormalizedListing]:
@@ -174,6 +206,9 @@ class MobileDeHttpScraper:
             if price_match:
                 # Formato alemán: punto como separador de miles, sin decimales
                 price_eur = float(price_match.group(1).replace(".", ""))
+        
+        # Extraer información del vendedor
+        seller_info = self._extract_seller_info(tree)
         
         # Extraer datos de KeyFeatures (mileage, power, fuel, transmission, first_registration, previous_owners)
         tech_data = self._extract_key_features(tree)
@@ -241,7 +276,60 @@ class MobileDeHttpScraper:
             doors=tech_data.get("doors"),
             color_exterior=tech_data.get("color_exterior"),
             previous_owners=tech_data.get("previous_owners"),
+            seller=seller_info,
             metadata=metadata,
+        )
+
+    def _extract_seller_info(self, tree: HTMLParser) -> Optional[dict]:
+        """Extraer información del vendedor"""
+        from ..models import Seller
+        
+        # Buscar el contenedor del vendedor
+        seller_container = tree.css_first('div.MainSellerInfo_titleAndRatingBlock__rDi0i')
+        if not seller_container:
+            return None
+        
+        # Extraer el texto del label
+        label_node = seller_container.css_first('div.typography_label__EkjGc')
+        if not label_node:
+            return None
+        
+        label_text = label_node.text(strip=True)
+        
+        # Determinar tipo de vendedor
+        # Buscar patrones en español y alemán
+        is_private = any(keyword in label_text.lower() for keyword in [
+            'vendedor particular', 'particular', 'privat', 'private seller', 'privatverkäufer'
+        ])
+        
+        seller_type = "private" if is_private else "dealer"
+        seller_name = None
+        rating = None
+        rating_count = None
+        
+        if not is_private:
+            # Si es concesionario, buscar el nombre en el enlace
+            link_node = label_node.css_first('a.link_Link__B0oSi')
+            if link_node:
+                seller_name = link_node.text(strip=True)
+            
+            # Buscar rating
+            rating_node = seller_container.css_first('div.ratingStars_RatingStars__fKi_d')
+            if rating_node:
+                # Extraer rating del label sr-only
+                sr_label = rating_node.css_first('span.ratingStars_SrOnlyRatingStarsLabel__03fSs')
+                if sr_label:
+                    rating_text = sr_label.text(strip=True)
+                    # Formato: "4.6 estrellas" o "4.6 stars"
+                    rating_match = re.search(r'(\d+\.?\d*)', rating_text)
+                    if rating_match:
+                        rating = float(rating_match.group(1))
+        
+        return Seller(
+            type=seller_type,
+            name=seller_name,
+            rating=rating,
+            rating_count=rating_count
         )
 
     def _extract_key_features(self, tree: HTMLParser) -> Dict[str, Any]:
@@ -408,4 +496,144 @@ class MobileDeHttpScraper:
             data["color_exterior"] = color_match.group(1).strip()
         
         return data
+    
+    def _print_import_analysis(self, listings: List[NormalizedListing]) -> None:
+        """Imprime análisis de costes de importación para cada anuncio"""
+        
+        for idx, listing in enumerate(listings, 1):
+            print(f"\n{'-'*80}")
+            print(f"ANUNCIO #{idx}")
+            print(f"{'-'*80}")
+            
+            # Información básica
+            print(f"Vehiculo: {listing.title}")
+            print(f"URL: {listing.url}")
+            print(f"Precio Alemania: {listing.price_eur:,.2f} EUR")
+            
+            # Tipo de vendedor
+            seller_type_label = "Concesionario" if listing.seller and listing.seller.type == "dealer" else "Particular"
+            seller_name = f" ({listing.seller.name})" if listing.seller and listing.seller.name else ""
+            print(f"{seller_type_label}{seller_name}")
+            
+            # Datos técnicos relevantes
+            if listing.mileage_km:
+                print(f"Kilometraje: {listing.mileage_km:,} km")
+            if listing.first_registration:
+                print(f"Primera matriculacion: {listing.first_registration.month}/{listing.first_registration.year}")
+            if listing.power_hp:
+                print(f"Potencia: {listing.power_hp} CV")
+            
+            # CO2 y cálculo de costes
+            if listing.co2_emissions_g_km:
+                print(f"CO2: {listing.co2_emissions_g_km} g/km")
+                self._calculate_and_print_import_costs(listing, listing.co2_emissions_g_km)
+            else:
+                print(f"ADVERTENCIA: CO2 no disponible")
+                print(f"\nCalculando rangos segun posibles emisiones de CO2:")
+                self._print_co2_scenarios(listing)
+    
+    def _calculate_and_print_import_costs(self, listing: NormalizedListing, co2: int) -> None:
+        """Calcula y muestra los costes de importación para un CO2 específico"""
+        
+        if not listing.price_eur:
+            print("❌ No se puede calcular (precio no disponible)")
+            return
+        
+        # Determinar tipo de compra según el vendedor
+        is_dealer = listing.seller and listing.seller.type == "dealer"
+        
+        print(f"\nCOSTES DE IMPORTACION:")
+        
+        if is_dealer:
+            # Mostrar ambos casos de empresa
+            print(f"\n  Caso 1: Compra a EMPRESA (IVA Aleman)")
+            costes_iva = import_calculator.calcular_costes_importacion(
+                listing.price_eur,
+                TipoCompra.EMPRESA_IVA,
+                co2
+            )
+            print(f"     Precio Alemania:    {listing.price_eur:>10,.2f}€")
+            print(f"     + ITP:              {costes_iva['itp']:>10,.2f}€")
+            print(f"     + IEDMT ({costes_iva['tasa_iedmt']}%):    {costes_iva['iedmt']:>10,.2f}€")
+            print(f"     + Transporte:       {costes_iva['transporte']:>10,.2f}€")
+            print(f"     + ITV:              {costes_iva['itv_tasa']:>10,.2f}€")
+            print(f"     + Traducciones:     {costes_iva['traducciones']:>10,.2f}€")
+            print(f"     + IVTM:             {costes_iva['ivtm']:>10,.2f}€")
+            print(f"     + Placas:           {costes_iva['placas']:>10,.2f}€")
+            print(f"     {'-'*36}")
+            print(f"     = BREAK-EVEN:    {costes_iva['break_even']:>10,.2f} EUR")
+            
+            print(f"\n  Caso 2: Compra a EMPRESA (Regimen Margen 25a)")
+            costes_margen = import_calculator.calcular_costes_importacion(
+                listing.price_eur,
+                TipoCompra.EMPRESA_MARGEN,
+                co2
+            )
+            print(f"     Precio Alemania:    {listing.price_eur:>10,.2f}€")
+            print(f"     + ITP:              {costes_margen['itp']:>10,.2f}€")
+            print(f"     + IEDMT ({costes_margen['tasa_iedmt']}%):    {costes_margen['iedmt']:>10,.2f}€")
+            print(f"     + Costes base:      {costes_margen['costes_base_total']:>10,.2f}€")
+            print(f"     {'-'*36}")
+            print(f"     = BREAK-EVEN:    {costes_margen['break_even']:>10,.2f} EUR")
+            
+            # Destacar el mejor
+            print(f"\n  Rango de precio en Espana: {costes_iva['break_even']:,.2f} EUR - {costes_margen['break_even']:,.2f} EUR")
+        else:
+            # Particular
+            print(f"\n  Compra a PARTICULAR")
+            costes = import_calculator.calcular_costes_importacion(
+                listing.price_eur,
+                TipoCompra.PARTICULAR,
+                co2
+            )
+            print(f"     Precio Alemania:    {listing.price_eur:>10,.2f}€")
+            print(f"     + ITP (4%):         {costes['itp']:>10,.2f}€")
+            print(f"     + IEDMT ({costes['tasa_iedmt']}%):    {costes['iedmt']:>10,.2f}€")
+            print(f"     + Transporte:       {costes['transporte']:>10,.2f}€")
+            print(f"     + ITV:              {costes['itv_tasa']:>10,.2f}€")
+            print(f"     + Traducciones:     {costes['traducciones']:>10,.2f}€")
+            print(f"     + IVTM:             {costes['ivtm']:>10,.2f}€")
+            print(f"     + Placas:           {costes['placas']:>10,.2f}€")
+            print(f"     {'-'*36}")
+            print(f"     = BREAK-EVEN:    {costes['break_even']:>10,.2f} EUR")
+    
+    def _print_co2_scenarios(self, listing: NormalizedListing) -> None:
+        """Muestra escenarios de coste según diferentes rangos de CO2"""
+        
+        if not listing.price_eur:
+            print("❌ No se puede calcular (precio no disponible)")
+            return
+        
+        is_dealer = listing.seller and listing.seller.type == "dealer"
+        
+        # Escenarios de CO2
+        scenarios = [
+            ("MEJOR CASO (CO2 <=120 g/km, IEDMT 0%)", 120),
+            ("CASO MEDIO (CO2 121-159 g/km, IEDMT 4.75%)", 140),
+            ("PEOR CASO (CO2 >=200 g/km, IEDMT 14.75%)", 200),
+        ]
+        
+        print()
+        for label, co2 in scenarios:
+            print(f"  {'-'*76}")
+            print(f"  {label}")
+            print(f"  {'-'*76}")
+            
+            if is_dealer:
+                # Mostrar rango para empresa
+                costes_iva = import_calculator.calcular_costes_importacion(
+                    listing.price_eur, TipoCompra.EMPRESA_IVA, co2
+                )
+                costes_margen = import_calculator.calcular_costes_importacion(
+                    listing.price_eur, TipoCompra.EMPRESA_MARGEN, co2
+                )
+                print(f"  Precio:       {listing.price_eur:>10,.2f}€ + IEDMT ({costes_iva['tasa_iedmt']}%): {costes_iva['iedmt']:,.2f}€ + Costes: {costes_iva['costes_base_total']:,.2f}€")
+                print(f"  Break-even: {costes_iva['break_even']:,.2f} EUR - {costes_margen['break_even']:,.2f} EUR")
+            else:
+                # Particular
+                costes = import_calculator.calcular_costes_importacion(
+                    listing.price_eur, TipoCompra.PARTICULAR, co2
+                )
+                print(f"  Precio:       {listing.price_eur:>10,.2f}€ + ITP: {costes['itp']:,.2f}€ + IEDMT ({costes['tasa_iedmt']}%): {costes['iedmt']:,.2f}€ + Costes: {costes['costes_base_total']:,.2f}€")
+                print(f"  Break-even: {costes['break_even']:,.2f} EUR")
 

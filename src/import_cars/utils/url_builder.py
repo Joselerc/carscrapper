@@ -3,7 +3,12 @@ URL builder utilities for different scraping sources
 """
 from typing import Optional
 from ..filters import UnifiedFilters
-from ..data import MOBILE_DE_MAKES, MOBILE_DE_FUEL_TYPES, MOBILE_DE_TRANSMISSION_TYPES
+from ..data import (
+    MOBILE_DE_MAKES,
+    MOBILE_DE_FUEL_TYPES,
+    MOBILE_DE_TRANSMISSION_TYPES,
+    get_mobilede_model_id_by_name,
+)
 
 
 def build_mobile_de_search_url(filters: UnifiedFilters, page: int = 1) -> str:
@@ -35,8 +40,17 @@ def build_mobile_de_search_url(filters: UnifiedFilters, page: int = 1) -> str:
     if filters.make:
         make_code = MOBILE_DE_MAKES.get(filters.make.upper())
         if make_code:
-            # Por ahora sin modelo (;;) - se añadirá cuando tengamos los códigos de modelos
-            params.append(f"ms={make_code}%3B%3B")  # %3B%3B es ;; URL-encoded
+            # Si se proporciona modelo, buscar su ID
+            if filters.model:
+                model_id = get_mobilede_model_id_by_name(make_code, filters.model)
+                if model_id:
+                    params.append(f"ms={make_code}%3B{model_id}%3B")  # %3B es ; URL-encoded
+                else:
+                    # Si no se encuentra el modelo, solo usar la marca
+                    params.append(f"ms={make_code}%3B%3B")
+            else:
+                # Solo marca sin modelo
+                params.append(f"ms={make_code}%3B%3B")
     
     # Precio (p=MIN:MAX)
     if filters.price_range:
@@ -94,6 +108,12 @@ def build_mobile_de_search_url(filters: UnifiedFilters, page: int = 1) -> str:
             trans_code = MOBILE_DE_TRANSMISSION_TYPES.get(transmission.value)
             if trans_code:
                 params.append(f"tr={trans_code}")
+    
+    # Tipo de vendedor (st=DEALER o st=FSBO)
+    if filters.dealer_only:
+        params.append("st=DEALER")
+    elif filters.private_only:
+        params.append("st=FSBO")
     
     # Paginación (pageNumber=N)
     if page > 1:
